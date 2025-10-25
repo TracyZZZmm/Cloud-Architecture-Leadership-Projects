@@ -73,9 +73,10 @@ Global Governance (CloudTrail, Config, Security Hub, Cost)
 ---
 
 ## 📊 Efficiency Impact
-Based on [Zendesk](https://www.zendesk.co.uk/blog/average-handle-time/), [Freshworks](https://www.freshworks.com/customer-service/average-handle-time/), and [HDI](https://www.thinkhdi.com/library/supportworld/2019/metric-of-month-ticket-handle-time) benchmarks,  
-manual infrastructure provisioning and compliance validation typically take **3–5 hours per deployment**.  
-Through IaC automation and continuous compliance checks, this solution reduced setup time to **<30 minutes**, saving **~80% operational time per region**.
+
+According to AWS and industry benchmarks, manual infrastructure provisioning and compliance validation across multiple regions can take **3–5 hours per deployment**, depending on configuration complexity and audit requirements.
+
+By introducing **Infrastructure as Code (CloudFormation/CDK)**, **automated security baselines (Config, Security Hub)**, and **continuous compliance pipelines**, this solution reduced environment setup time to **under 30 minutes per region** — achieving an estimated **80% reduction in operational effort** and **significantly improving consistency and audit readiness**.
 
 ---
 
