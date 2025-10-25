@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  GlobalEdNet MVP ? Single-Stack Baseline: VPC (public/private), KMS CMK, S3 (KMS-encrypted),
+  CloudTrail (with S3 data events), AWS Config baseline, Security Hub Hub enablement,
+  + (conditional) AI/ML demo resources (SageMaker Notebook, Bedrock Lambda) behind EnableAI switch.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.30.0.0/16
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.30.0.0/24
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.30.1.0/24
+  EnableAI:
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+    Description: Toggle to create AI/ML demo resources (cost $$$). Keep "false"
+      until demo hour.
+
+Conditions:
+  CreateAI: !Equals
+    - !Ref EnableAI
+    - 'true'
+
+Resources:
+  # ---------------- VPC & Networking ----------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ge-mvp-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ge-mvp-igw
+
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ge-public-a
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: ge-private-a
+
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # ---------------- KMS ----------------
+  DataKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for S3 data & logs encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - kms:*
+            Resource: '*'
+
+  DataKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/ge-mvp-kms
+      TargetKeyId: !Ref DataKmsKey
+
+  # ---------------- S3: Data bucket (KMS-encrypted) ----------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ge-data-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataKmsKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceTLS
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub ${DataBucket.Arn}
+              - !Sub ${DataBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ---------------- CloudTrail (logs bucket + trail with S3 data events) ----------------
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ge-trail-logs-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${TrailBucket}
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${TrailBucket}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: ge-mvp-trail
+      S3BucketName: !Ref TrailBucket
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      IsLogging: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+        - ReadWriteType: All
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub arn:aws:s3:::${DataBucket}/
+
+  # -------- AWS Config --------
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "ge-config-logs-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------- Security Hub: only enable Hub (no standards) ----------------
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+
+  # ---------------- (Conditional) AI/ML demo resources ----------------
+  DemoSageMakerRole:
+    Condition: CreateAI
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Policies:
+        - PolicyName: bedrock-invoke-min
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+
+  DemoNotebook:
+    Condition: CreateAI
+    Type: AWS::SageMaker::NotebookInstance
+    Properties:
+      NotebookInstanceName: ge-mvp-notebook
+      InstanceType: ml.t3.medium
+      RoleArn: !GetAtt DemoSageMakerRole.Arn
+      KmsKeyId: !GetAtt DataKmsKey.Arn
+      SubnetId: !Ref PrivateSubnetA
+      VolumeSizeInGB: 5
+      DirectInternetAccess: Disabled
+
+  DemoBedrockLambdaRole:
+    Condition: CreateAI
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: bedrock-invoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+
+  DemoBedrockLambda:
+    Condition: CreateAI
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ge-mvp-bedrock-invoke
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DemoBedrockLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          def handler(event, context):
+              body = json.loads(event.get('body','{}')) if isinstance(event, dict) else {}
+              prompt = body.get('prompt','Hello AI from MVP')
+              client = boto3.client('bedrock-runtime')
+              model_id = os.environ.get('MODEL_ID','anthropic.claude-3-haiku-20240307-v1:0')
+              resp = client.invoke_model(
+                  modelId=model_id,
+                  contentType='application/json',
+                  accept='application/json',
+                  body=json.dumps({"messages":[{"role":"user","content":[{"type":"text","text":prompt}]}]})
+              )
+              out = json.loads(resp['body'].read())
+              return {"statusCode":200,"body":json.dumps(out)}
+      Environment:
+        Variables:
+          MODEL_ID: anthropic.claude-3-haiku-20240307-v1:0
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+  PublicSubnetId:
+    Value: !Ref PublicSubnetA
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnetA
+  DataBucketName:
+    Value: !Ref DataBucket
+  TrailBucketName:
+    Value: !Ref TrailBucket
+  ConfigBucketName:
+    Value: !Ref ConfigBucket
+  KmsKeyArn:
+    Value: !GetAtt DataKmsKey.Arn
+  SecurityHubEnabled:
+    Value: Enabled
